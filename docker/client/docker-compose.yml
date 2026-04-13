@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  serverstatus-client:
+    container_name: serverstatus-client
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    network_mode: host
+    pid: host
+    env_file: .env
+    environment:
+      SERVER_HOST: ${SERVER_HOST:-https://host.example.com}
+      SERVER_PORT: ${SERVER_PORT:-443}
+      GID: ${GID:-group1}
+      PASSWORD: ${PASSWORD:-changeme}
+      ALIAS: ${ALIAS:-unknown}
+      HOST_TYPE: ${HOST_TYPE:-kvm}
+      IP_SOURCE: ${IP_SOURCE:-ip-api.com}
+      INTERVAL: ${INTERVAL:-5}
+    volumes:
+      - ./vnstat/:/var/lib/vnstat/
+    depends_on:
+      - vnstat
+
+  vnstat:
+    container_name: vnstat
+    image: vergoh/vnstat:latest
+    restart: always
+    network_mode: host
+    command:
+      - vnstatd
+      - -n
+      - -t
+      - --user
+      - vnstat
+      - --group
+      - vnstat
+      - -s
+      - --config
+      - /etc/vnstat.conf
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./vnstat.conf:/etc/vnstat.conf
+      - ./vnstat/:/var/lib/vnstat/

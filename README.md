@@ -326,10 +326,9 @@ RUST_BACKTRACE=1 RUST_LOG=trace ./stat_server -c config.toml
 ./stat_server -c config.toml --notify-test
 
 # 🐳 docker 方式
-wget --no-check-certificate -qO docker-compose.yml 'https://raw.githubusercontent.com/zdz/ServerStatus-Rust/master/docker-compose.yml'
 wget --no-check-certificate -qO config.toml 'https://raw.githubusercontent.com/zdz/ServerStatus-Rust/master/config.toml'
 touch stats.json
-docker-compose up -d
+docker-compose -f docker/server/docker-compose.yml up -d
 ```
 
 ## 4. 客户端说明
