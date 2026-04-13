@@ -1,7 +1,6 @@
 #![allow(unused)]
 use anyhow::Result;
 use chrono::{Datelike, Local, Timelike};
-use once_cell::sync::OnceCell;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -10,7 +9,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::mpsc::sync_channel;
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,18 +23,18 @@ const OS_LIST: [&str; 10] = [
     "centos", "debian", "ubuntu", "arch", "windows", "macos", "pi", "android", "linux", "freebsd",
 ];
 
-static STAT_SENDER: OnceCell<SyncSender<Cow<HostStat>>> = OnceCell::new();
+static STAT_SENDER: OnceLock<SyncSender<Cow<HostStat>>> = OnceLock::new();
 
 pub struct StatsMgr {
-    resp_json: Arc<Mutex<String>>,
-    stats_data: Arc<Mutex<StatsResp>>,
+    resp_json: Arc<RwLock<String>>,
+    stats_data: Arc<RwLock<StatsResp>>,
 }
 
 impl StatsMgr {
     pub fn new() -> Self {
         Self {
-            resp_json: Arc::new(Mutex::new("{}".to_string())),
-            stats_data: Arc::new(Mutex::new(StatsResp::new())),
+            resp_json: Arc::new(RwLock::new("{}".to_string())),
+            stats_data: Arc::new(RwLock::new(StatsResp::new())),
         }
     }
 
@@ -85,7 +84,8 @@ impl StatsMgr {
         }
 
         let (stat_tx, stat_rx) = sync_channel(512);
-        STAT_SENDER.set(stat_tx).unwrap();
+        STAT_SENDER.set(stat_tx)
+            .map_err(|_| anyhow::anyhow!("Failed to initialize STAT_SENDER"))?;
         let (notifier_tx, notifier_rx) = sync_channel(512);
 
         let stat_map: Arc<Mutex<HashMap<String, Arc<HostStat>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -110,7 +110,7 @@ impl StatsMgr {
 
                         if let Ok(mut hosts_map) = hosts_map.lock() {
                             let host = hosts_map.get(&stat_t.name);
-                            if host.is_none() || !host.unwrap().gid.eq(&stat_t.gid) {
+                            if host.is_none() || host.map_or(true, |h| !h.gid.eq(&stat_t.gid)) {
                                 if let Some(group) = cfg.hosts_group_map.get(&stat_t.gid) {
                                     // 名称不变，换组了，更新组配置 & last in/out
                                     let mut inst = group.inst_host(&stat_t.name);
@@ -133,7 +133,9 @@ impl StatsMgr {
                             error!("invalid stat `{stat_t:?}");
                             continue;
                         }
-                        let info = host_info.unwrap();
+                        let Some(info) = host_info else {
+                            continue;
+                        };
 
                         if info.disabled {
                             continue;
@@ -157,7 +159,10 @@ impl StatsMgr {
                             stat_t.alias = info.alias.clone();
                         }
 
-                        info.latest_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        info.latest_ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
                         stat_t.latest_ts = info.latest_ts;
 
                         // last_network_in/out
@@ -319,19 +324,23 @@ impl StatsMgr {
                     latest_save_ts = now;
                     if !resp.servers.is_empty() {
                         if let Ok(mut file) = File::create("stats.json") {
-                            file.write_all(serde_json::to_string(&resp).unwrap().as_bytes());
-                            file.flush();
-                            trace!("save stats.json succ!");
+                            if let Ok(json) = serde_json::to_string(&resp) {
+                                let _ = file.write_all(json.as_bytes());
+                                let _ = file.flush();
+                                trace!("save stats.json succ!");
+                            }
                         } else {
                             error!("save stats.json fail!");
                         }
                     }
                 }
                 //
-                if let Ok(mut o) = resp_json.lock() {
-                    *o = serde_json::to_string(&resp).unwrap();
+                if let Ok(mut o) = resp_json.write() {
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        *o = json;
+                    }
                 }
-                if let Ok(mut o) = stats_data.lock() {
+                if let Ok(mut o) = stats_data.write() {
                     *o = resp;
                 }
             }
@@ -341,9 +350,12 @@ impl StatsMgr {
         thread::spawn(move || loop {
             while let Ok(msg) = notifier_rx.recv() {
                 let (e, stat) = msg;
-                let notify_list = &*notifies.lock().unwrap();
+                let Ok(notify_list) = notifies.lock() else {
+                    error!("Failed to lock notifies");
+                    continue;
+                };
                 trace!("recv notify => {e:?}, {stat:?}");
-                for n in notify_list {
+                for n in &*notify_list {
                     trace!("{} notify {:?} => {:?}", n.kind(), e, stat);
                     n.notify(&e, &stat);
                 }
@@ -353,19 +365,25 @@ impl StatsMgr {
         Ok(())
     }
 
-    pub fn get_stats(&self) -> Arc<Mutex<StatsResp>> {
+    pub fn get_stats(&self) -> Arc<RwLock<StatsResp>> {
         self.stats_data.clone()
     }
 
     pub fn get_stats_json(&self) -> String {
-        self.resp_json.lock().unwrap().to_string()
+        self.resp_json.read()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "{}".to_string())
     }
 
     #[allow(clippy::unused_self)]
     #[allow(clippy::unnecessary_wraps)]
     pub fn report(&self, data: serde_json::Value) -> Result<()> {
         static SENDER: LazyLock<SyncSender<Cow<'static, HostStat>>> =
-            LazyLock::new(|| STAT_SENDER.get().unwrap().clone());
+            LazyLock::new(|| {
+                STAT_SENDER.get()
+                    .expect("STAT_SENDER must be initialized before first report")
+                    .clone()
+            });
 
         match serde_json::from_value(data) {
             Ok(stat) => {
@@ -380,7 +398,8 @@ impl StatsMgr {
     }
 
     pub fn get_all_info(&self) -> Result<serde_json::Value> {
-        let data = self.stats_data.lock().unwrap();
+        let data = self.stats_data.read()
+            .map_err(|e| anyhow::anyhow!("Failed to read stats_data: {}", e))?;
         let mut resp_json = serde_json::to_value(&*data)?;
         // for skip_serializing
         if let Some(srv_list) = resp_json["servers"].as_array_mut() {

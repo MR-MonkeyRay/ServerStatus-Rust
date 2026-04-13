@@ -295,7 +295,7 @@ pub async fn get_detail(
     _auth: auth::AdminAuth,
 ) -> Response {
     let resp = G_STATS_MGR.get().unwrap().get_stats();
-    let o = resp.lock().unwrap();
+    let o = resp.read().unwrap();
 
     let mut table = Table::new();
     table.set_titles(row![

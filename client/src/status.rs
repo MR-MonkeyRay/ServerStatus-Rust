@@ -1,6 +1,5 @@
 #![allow(unused)]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::similar_names, clippy::many_single_char_names)]
-use once_cell::sync::OnceCell;
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::LinkedList;
@@ -14,7 +13,8 @@ use std::net::{Shutdown, ToSocketAddrs};
 use std::process::Command;
 use std::str;
 use std::sync::Arc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,97 +27,114 @@ const TIMEOUT_MS: u64 = 1000;
 
 pub fn get_uptime() -> u64 {
     fs::read_to_string("/proc/uptime")
-        .map(|contents| {
-            if let Some(s) = contents.split('.').next() {
-                return s.parse::<u64>().unwrap_or(0);
-            }
-            0
-        })
-        .unwrap()
+        .ok()
+        .and_then(|contents| parse_uptime(&contents))
+        .unwrap_or(0)
 }
 
 pub fn get_loadavg() -> (f64, f64, f64) {
     fs::read_to_string("/proc/loadavg")
-        .map(|contents| {
-            let vec = contents.split_whitespace().collect::<Vec<_>>();
-            // dbg!(&vec);
-            if vec.len() >= 3 {
-                let a = vec[0..3]
-                    .iter()
-                    .map(|v| v.parse::<f64>().unwrap())
-                    .collect::<Vec<f64>>();
+        .ok()
+        .and_then(|contents| parse_loadavg(&contents))
+        .unwrap_or((0.0, 0.0, 0.0))
+}
 
-                return (a[0], a[1], a[2]);
-            }
-            (0.0, 0.0, 0.0)
-        })
-        .unwrap()
+fn parse_uptime(content: &str) -> Option<u64> {
+    content
+        .split('.').next()
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+fn parse_loadavg(content: &str) -> Option<(f64, f64, f64)> {
+    let vec = content.split_whitespace().collect::<Vec<_>>();
+    if vec.len() < 3 {
+        return None;
+    }
+
+    let a: Vec<f64> = vec[0..3]
+        .iter()
+        .filter_map(|v| v.parse::<f64>().ok())
+        .collect();
+    if a.len() == 3 {
+        Some((a[0], a[1], a[2]))
+    } else {
+        None
+    }
 }
 
 static MEMORY_REGEX: &str = r"^(?P<key>\S*):\s*(?P<value>\d*)\s*kB";
-static MEMORY_REGEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(MEMORY_REGEX).unwrap());
+static MEMORY_REGEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(MEMORY_REGEX).expect("Invalid memory regex"));
 pub fn get_memory() -> (u64, u64, u64, u64) {
-    let file = File::open("/proc/meminfo").unwrap();
+    let Ok(file) = File::open("/proc/meminfo") else {
+        return (0, 0, 0, 0);
+    };
     let buf_reader = BufReader::new(file);
     let mut res_dict = HashMap::new();
     for line in buf_reader.lines() {
-        let l = line.unwrap();
+        let Ok(l) = line else { continue };
         if let Some(caps) = MEMORY_REGEX_RE.captures(&l) {
-            res_dict.insert(caps["key"].to_string(), caps["value"].parse::<u64>().unwrap());
+            if let Ok(value) = caps["value"].parse::<u64>() {
+                res_dict.insert(caps["key"].to_string(), value);
+            }
         }
     }
 
-    let mem_total = res_dict["MemTotal"];
-    let swap_total = res_dict["SwapTotal"];
-    let swap_free = res_dict["SwapFree"];
+    let mem_total = *res_dict.get("MemTotal").unwrap_or(&0);
+    let swap_total = *res_dict.get("SwapTotal").unwrap_or(&0);
+    let swap_free = *res_dict.get("SwapFree").unwrap_or(&0);
 
-    let mem_used =
-        mem_total - res_dict["MemFree"] - res_dict["Buffers"] - res_dict["Cached"] - res_dict["SReclaimable"];
+    let mem_used = mem_total
+        .saturating_sub(*res_dict.get("MemFree").unwrap_or(&0))
+        .saturating_sub(*res_dict.get("Buffers").unwrap_or(&0))
+        .saturating_sub(*res_dict.get("Cached").unwrap_or(&0))
+        .saturating_sub(*res_dict.get("SReclaimable").unwrap_or(&0));
 
     (mem_total, mem_used, swap_total, swap_free)
 }
 
 macro_rules! exec_shell_cmd_fetch_u32 {
     ($shell_cmd:expr) => {{
-        let a = &Command::new("/bin/sh")
+        Command::new("/bin/sh")
             .args(&["-c", $shell_cmd])
             .output()
-            .expect("failed to execute process")
-            .stdout;
-        str::from_utf8(a).unwrap().trim().parse::<u32>().unwrap()
+            .ok()
+            .and_then(|output| str::from_utf8(&output.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
     }};
 }
 
 pub fn tupd() -> (u32, u32, u32, u32) {
-    let t = exec_shell_cmd_fetch_u32!("ss -t | wc -l") - 1;
-    let u = exec_shell_cmd_fetch_u32!("ss -u | wc -l") - 1;
-    let p = exec_shell_cmd_fetch_u32!("ps -ef | wc -l") - 2;
-    let d = exec_shell_cmd_fetch_u32!("ps -eLf | wc -l") - 2;
+    let t = exec_shell_cmd_fetch_u32!("ss -t | wc -l").saturating_sub(1);
+    let u = exec_shell_cmd_fetch_u32!("ss -u | wc -l").saturating_sub(1);
+    let p = exec_shell_cmd_fetch_u32!("ps -ef | wc -l").saturating_sub(2);
+    let d = exec_shell_cmd_fetch_u32!("ps -eLf | wc -l").saturating_sub(2);
 
     (t, u, p, d)
 }
 
 static TRAFFIC_REGEX: &str =
     r"([^\s]+):[\s]{0,}(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)";
-static TRAFFIC_REGEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(TRAFFIC_REGEX).unwrap());
+static TRAFFIC_REGEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(TRAFFIC_REGEX).expect("Invalid traffic regex"));
 pub fn get_sys_traffic(args: &Args) -> (u64, u64) {
     let (mut network_in, mut network_out) = (0, 0);
-    let file = File::open("/proc/net/dev").unwrap();
+    let Ok(file) = File::open("/proc/net/dev") else {
+        return (0, 0);
+    };
     let buf_reader = BufReader::new(file);
     for line in buf_reader.lines() {
-        let l = line.unwrap();
+        let Ok(l) = line else { continue };
 
         TRAFFIC_REGEX_RE.captures(&l).and_then(|caps| {
-            // println!("caps[0]=>{:?}", caps.get(0).unwrap().as_str());
-            let name = caps.get(1).unwrap().as_str();
+            let name = caps.get(1)?.as_str();
 
             // spec iface
             if args.skip_iface(name) {
                 return None;
             }
 
-            let net_in = caps.get(2).unwrap().as_str().parse::<u64>().unwrap();
-            let net_out = caps.get(10).unwrap().as_str().parse::<u64>().unwrap();
+            let net_in = caps.get(2)?.as_str().parse::<u64>().ok()?;
+            let net_out = caps.get(10)?.as_str().parse::<u64>().ok()?;
 
             network_in += net_in;
             network_out += net_out;
@@ -130,41 +147,46 @@ pub fn get_sys_traffic(args: &Args) -> (u64, u64) {
 
 static DF_CMD:&str = "df -Tlm --total -t ext4 -t ext3 -t ext2 -t reiserfs -t jfs -t ntfs -t fat32 -t btrfs -t fuseblk -t zfs -t simfs -t xfs";
 pub fn get_hdd(stat: &mut StatRequest) {
-    let (mut hdd_total, mut hdd_used) = (0, 0);
-    let a = &Command::new("/bin/sh")
+    let output = Command::new("/bin/sh")
         .args(["-c", DF_CMD])
-        .output()
-        .expect("failed to execute df")
-        .stdout;
+        .output();
 
-    let _ = str::from_utf8(a).map(|content| {
-        let vs = content.lines().collect::<Vec<&str>>();
+    let Ok(output) = output else { return };
+    let Ok(content) = str::from_utf8(&output.stdout) else { return };
 
-        for (idx, s) in vs.iter().enumerate() {
-            // header
-            if idx == 0 {
-                continue;
-            }
+    let vs: Vec<&str> = content.lines().collect();
 
-            let vec = (*s).split_whitespace().collect::<Vec<&str>>();
-            if idx == vs.len() - 1 {
-                // total
-                stat.hdd_total = vec[2].parse::<u64>().unwrap();
-                stat.hdd_used = vec[3].parse::<u64>().unwrap();
-            } else {
-                let di = DiskInfo {
-                    name: vec[0].to_string(),
-                    mount_point: vec[6].to_string(),
-                    file_system: vec[1].to_string(),
-                    // TODO: fix this
-                    total: vec[2].parse::<u64>().unwrap() * 1024 * 1024,
-                    used: vec[3].parse::<u64>().unwrap() * 1024 * 1024,
-                    free: vec[4].parse::<u64>().unwrap() * 1024 * 1024,
-                };
-                stat.disks.push(di);
-            }
+    for (idx, s) in vs.iter().enumerate() {
+        // header
+        if idx == 0 {
+            continue;
         }
-    });
+
+        let vec: Vec<&str> = (*s).split_whitespace().collect();
+        if vec.len() < 7 {
+            continue;
+        }
+
+        if idx == vs.len() - 1 {
+            // total
+            stat.hdd_total = vec[2].parse::<u64>().unwrap_or(0);
+            stat.hdd_used = vec[3].parse::<u64>().unwrap_or(0);
+        } else {
+            let total = vec[2].parse::<u64>().unwrap_or(0);
+            let used = vec[3].parse::<u64>().unwrap_or(0);
+            let free = vec[4].parse::<u64>().unwrap_or(0);
+
+            let di = DiskInfo {
+                name: vec[0].to_string(),
+                mount_point: vec[6].to_string(),
+                file_system: vec[1].to_string(),
+                total: total * 1024 * 1024,
+                used: used * 1024 * 1024,
+                free: free * 1024 * 1024,
+            };
+            stat.disks.push(di);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -177,7 +199,7 @@ pub struct NetSpeed {
     pub avgtx: u64,
 }
 
-pub static G_NET_SPEED: LazyLock<Arc<Mutex<NetSpeed>>> = LazyLock::new(|| Arc::new(Mutex::default()));
+pub static G_NET_SPEED: LazyLock<Arc<RwLock<NetSpeed>>> = LazyLock::new(|| Arc::new(RwLock::default()));
 
 #[allow(unused)]
 pub fn start_net_speed_collect_t(args: &Args) {
@@ -187,7 +209,7 @@ pub fn start_net_speed_collect_t(args: &Args) {
             let buf_reader = BufReader::new(file);
             let (mut avgrx, mut avgtx) = (0, 0);
             for line in buf_reader.lines() {
-                let l = line.unwrap();
+                let Ok(l) = line else { continue };
                 let v: Vec<&str> = l.split(':').collect();
                 if v.len() < 2 {
                     continue;
@@ -199,17 +221,33 @@ pub fn start_net_speed_collect_t(args: &Args) {
                 }
 
                 let v1: Vec<&str> = v[1].split_whitespace().collect();
-                avgrx += v1[0].parse::<u64>().unwrap();
-                avgtx += v1[8].parse::<u64>().unwrap();
+                if v1.len() <= 8 {
+                    continue;
+                }
+
+                let Some(rx) = v1[0].parse::<u64>().ok() else {
+                    continue;
+                };
+                let Some(tx) = v1[8].parse::<u64>().ok() else {
+                    continue;
+                };
+
+                avgrx += rx;
+                avgtx += tx;
             }
 
             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as f64;
 
-            if let Ok(mut t) = G_NET_SPEED.lock() {
+            if let Ok(mut t) = G_NET_SPEED.write() {
                 t.diff = now - t.clock;
                 t.clock = now;
-                t.netrx = ((avgrx - t.avgrx) as f64 / t.diff) as u64;
-                t.nettx = ((avgtx - t.avgtx) as f64 / t.diff) as u64;
+                if t.diff > 0.0 {
+                    t.netrx = (avgrx.saturating_sub(t.avgrx) as f64 / t.diff) as u64;
+                    t.nettx = (avgtx.saturating_sub(t.avgtx) as f64 / t.diff) as u64;
+                } else {
+                    t.netrx = 0;
+                    t.nettx = 0;
+                }
                 t.avgrx = avgrx;
                 t.avgtx = avgtx;
 
@@ -220,7 +258,8 @@ pub fn start_net_speed_collect_t(args: &Args) {
     });
 }
 
-pub static G_CPU_PERCENT: LazyLock<Arc<Mutex<f64>>> = LazyLock::new(|| Arc::new(Mutex::default()));
+// Store CPU percentage as u64 (value * 100) for atomic operations
+pub static G_CPU_PERCENT: AtomicU64 = AtomicU64::new(0);
 #[allow(unused)]
 pub fn start_cpu_percent_collect_t() {
     let mut pre_cpu: Vec<u64> = vec![0, 0, 0, 0];
@@ -250,10 +289,9 @@ pub fn start_cpu_percent_collect_t() {
 
                 pre_cpu = cur_cpu;
 
-                if let Ok(mut cpu_percent) = G_CPU_PERCENT.lock() {
-                    *cpu_percent = res.round();
-                    // dbg!(cpu_percent);
-                }
+                // Store as integer (percentage * 100) for atomic operations
+                let cpu_int = (res.round() * 100.0) as u64;
+                G_CPU_PERCENT.store(cpu_int, Ordering::Relaxed);
             });
         });
 
@@ -341,9 +379,9 @@ fn start_ping_collect_t(data: &Arc<Mutex<PingData>>) {
     });
 }
 
-pub static G_PING_10010: OnceCell<Arc<Mutex<PingData>>> = OnceCell::new();
-pub static G_PING_189: OnceCell<Arc<Mutex<PingData>>> = OnceCell::new();
-pub static G_PING_10086: OnceCell<Arc<Mutex<PingData>>> = OnceCell::new();
+pub static G_PING_10010: OnceLock<Arc<Mutex<PingData>>> = OnceLock::new();
+pub static G_PING_189: OnceLock<Arc<Mutex<PingData>>> = OnceLock::new();
+pub static G_PING_10086: OnceLock<Arc<Mutex<PingData>>> = OnceLock::new();
 
 pub fn start_all_ping_collect_t(args: &Args) {
     G_PING_10010
@@ -412,11 +450,10 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
         stat.network_out = network_out;
     }
 
-    if let Ok(o) = G_CPU_PERCENT.lock() {
-        stat.cpu = *o;
-    }
+    // Load CPU percentage from atomic (stored as value * 100)
+    stat.cpu = G_CPU_PERCENT.load(Ordering::Relaxed) as f64 / 100.0;
 
-    if let Ok(o) = G_NET_SPEED.lock() {
+    if let Ok(o) = G_NET_SPEED.read() {
         stat.network_rx = o.netrx;
         stat.network_tx = o.nettx;
     }
@@ -434,5 +471,77 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
         let o = &*G_PING_10086.get().unwrap().lock().unwrap();
         stat.ping_10086 = o.lost_rate.into();
         stat.time_10086 = o.ping_time.into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_regex_valid_line() {
+        let line = "MemTotal:       16384000 kB";
+        let caps = MEMORY_REGEX_RE.captures(line).unwrap();
+        assert_eq!(caps.name("key").unwrap().as_str(), "MemTotal");
+        assert_eq!(caps.name("value").unwrap().as_str(), "16384000");
+    }
+
+    #[test]
+    fn test_memory_regex_with_spaces() {
+        let line = "MemFree:        8192000 kB";
+        let caps = MEMORY_REGEX_RE.captures(line).unwrap();
+        assert_eq!(caps.name("key").unwrap().as_str(), "MemFree");
+        assert_eq!(caps.name("value").unwrap().as_str(), "8192000");
+    }
+
+    #[test]
+    fn test_memory_regex_invalid_line() {
+        let line = "Invalid line without proper format";
+        assert!(MEMORY_REGEX_RE.captures(line).is_none());
+    }
+
+    #[test]
+    fn test_traffic_regex_valid_line() {
+        let line = "eth0: 1000 2000 0 0 0 0 0 0 3000 4000 0 0 0 0 0 0";
+        assert!(TRAFFIC_REGEX_RE.is_match(line));
+        
+        let caps = TRAFFIC_REGEX_RE.captures(line).unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "eth0");
+        assert_eq!(caps.get(2).unwrap().as_str(), "1000");  // rx bytes
+        assert_eq!(caps.get(10).unwrap().as_str(), "3000"); // tx bytes
+    }
+
+    #[test]
+    fn test_traffic_regex_with_interface_name() {
+        let line = "wlan0:  500000 1000 0 0 0 0 0 0 250000 500 0 0 0 0 0 0";
+        assert!(TRAFFIC_REGEX_RE.is_match(line));
+        
+        let caps = TRAFFIC_REGEX_RE.captures(line).unwrap();
+        assert_eq!(caps.get(1).unwrap().as_str(), "wlan0");
+        assert_eq!(caps.get(2).unwrap().as_str(), "500000");
+        assert_eq!(caps.get(10).unwrap().as_str(), "250000");
+    }
+
+    #[test]
+    fn test_traffic_regex_invalid_line() {
+        let line = "Invalid: not enough fields";
+        assert!(!TRAFFIC_REGEX_RE.is_match(line));
+    }
+
+    #[test]
+    fn test_get_uptime_fallback() {
+        assert_eq!(parse_uptime("12345.67 890.12\n"), Some(12345));
+        assert_eq!(parse_uptime("invalid"), None);
+        assert_eq!(parse_uptime(""), None);
+    }
+
+    #[test]
+    fn test_get_loadavg_fallback() {
+        assert_eq!(
+            parse_loadavg("0.12 0.34 0.56 1/234 5678\n"),
+            Some((0.12, 0.34, 0.56))
+        );
+        assert_eq!(parse_loadavg("0.12 0.34"), None);
+        assert_eq!(parse_loadavg("0.12 nope 0.56"), None);
     }
 }

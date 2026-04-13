@@ -1,7 +1,6 @@
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use tokio::runtime::Handle;
 
 use crate::payload::HostStat;
@@ -12,7 +11,7 @@ pub mod tgbot;
 pub mod webhook;
 pub mod wechat;
 
-pub static NOTIFIER_HANDLE: Lazy<Mutex<Option<Handle>>> = Lazy::new(Default::default);
+pub static NOTIFIER_HANDLE: LazyLock<Mutex<Option<Handle>>> = LazyLock::new(Default::default);
 
 #[derive(Debug, Serialize, Clone)]
 pub enum Event {

@@ -4,11 +4,10 @@ extern crate log;
 extern crate pretty_env_logger;
 use clap::Parser;
 use hyper::header;
-use once_cell::sync::Lazy;
 use prost::Message;
 use std::net::ToSocketAddrs;
 use std::process;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +33,7 @@ pub struct ClientConfig {
     sys_info: Option<SysInfo>,
 }
 
-pub static G_CONFIG: Lazy<Mutex<ClientConfig>> = Lazy::new(|| Mutex::new(ClientConfig::default()));
+pub static G_CONFIG: LazyLock<Mutex<ClientConfig>> = LazyLock::new(|| Mutex::new(ClientConfig::default()));
 
 // https://docs.rs/clap/latest/clap/_derive/index.html#command-attributes
 #[derive(Parser, Debug, Clone)]

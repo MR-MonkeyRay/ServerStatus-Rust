@@ -244,3 +244,208 @@ pub fn test_from_file(cfg: &str) -> Result<Config> {
         .unwrap()
         .map_err(anyhow::Error::new)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_host_auth_success() {
+        let mut config = Config {
+            hosts_map: HashMap::new(),
+            ..Default::default()
+        };
+
+        let host = Host {
+            name: "test_host".to_string(),
+            password: "test_pass".to_string(),
+            ..Default::default()
+        };
+
+        config.hosts_map.insert("test_host".to_string(), host);
+
+        assert!(config.auth("test_host", "test_pass"));
+    }
+
+    #[test]
+    fn test_host_auth_wrong_password() {
+        let mut config = Config {
+            hosts_map: HashMap::new(),
+            ..Default::default()
+        };
+
+        let host = Host {
+            name: "test_host".to_string(),
+            password: "correct_pass".to_string(),
+            ..Default::default()
+        };
+
+        config.hosts_map.insert("test_host".to_string(), host);
+
+        assert!(!config.auth("test_host", "wrong_pass"));
+    }
+
+    #[test]
+    fn test_host_auth_nonexistent_user() {
+        let config = Config {
+            hosts_map: HashMap::new(),
+            ..Default::default()
+        };
+
+        assert!(!config.auth("nonexistent", "any_pass"));
+    }
+
+    #[test]
+    fn test_group_auth_success() {
+        let mut config = Config {
+            hosts_group_map: HashMap::new(),
+            ..Default::default()
+        };
+
+        let group = HostGroup {
+            gid: "test_group".to_string(),
+            password: "group_pass".to_string(),
+            location: String::new(),
+            r#type: String::new(),
+            notify: true,
+            pos: 0,
+            weight: 0,
+            labels: String::new(),
+        };
+
+        config.hosts_group_map.insert("test_group".to_string(), group);
+
+        assert!(config.group_auth("test_group", "group_pass"));
+    }
+
+    #[test]
+    fn test_group_auth_failure() {
+        let mut config = Config {
+            hosts_group_map: HashMap::new(),
+            ..Default::default()
+        };
+
+        let group = HostGroup {
+            gid: "test_group".to_string(),
+            password: "correct_pass".to_string(),
+            location: String::new(),
+            r#type: String::new(),
+            notify: true,
+            pos: 0,
+            weight: 0,
+            labels: String::new(),
+        };
+
+        config.hosts_group_map.insert("test_group".to_string(), group);
+
+        assert!(!config.group_auth("test_group", "wrong_pass"));
+        assert!(!config.group_auth("nonexistent_group", "any_pass"));
+    }
+
+    #[test]
+    fn test_admin_auth_success() {
+        let config = Config {
+            admin_user: Some("admin".to_string()),
+            admin_pass: Some("admin_pass".to_string()),
+            ..Default::default()
+        };
+
+        assert!(config.admin_auth("admin", "admin_pass"));
+    }
+
+    #[test]
+    fn test_admin_auth_failure() {
+        let config = Config {
+            admin_user: Some("admin".to_string()),
+            admin_pass: Some("correct_pass".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!config.admin_auth("admin", "wrong_pass"));
+        assert!(!config.admin_auth("wrong_user", "correct_pass"));
+    }
+
+    #[test]
+    fn test_admin_auth_no_credentials() {
+        let config = Config {
+            admin_user: None,
+            admin_pass: None,
+            ..Default::default()
+        };
+
+        assert!(!config.admin_auth("any_user", "any_pass"));
+    }
+
+    #[test]
+    fn test_host_group_inst_host() {
+        let group = HostGroup {
+            gid: "group1".to_string(),
+            password: "pass123".to_string(),
+            location: "Beijing".to_string(),
+            r#type: "VPS".to_string(),
+            notify: true,
+            pos: 5,
+            weight: 100,
+            labels: "prod,web".to_string(),
+        };
+
+        let host = group.inst_host("server1");
+
+        assert_eq!(host.name, "server1");
+        assert_eq!(host.gid, "group1");
+        assert_eq!(host.password, "pass123");
+        assert_eq!(host.location, "Beijing");
+        assert_eq!(host.r#type, "VPS");
+        assert_eq!(host.monthstart, 1);
+        assert!(host.notify);
+        assert_eq!(host.pos, 5);
+        assert_eq!(host.weight, 100);
+        assert_eq!(host.labels, "prod,web");
+    }
+
+    #[test]
+    fn test_config_to_json_value() {
+        let config = Config {
+            http_addr: "0.0.0.0:8080".to_string(),
+            grpc_addr: "0.0.0.0:9394".to_string(),
+            ..Default::default()
+        };
+
+        let result = config.to_json_value();
+        assert!(result.is_ok());
+
+        let json = result.unwrap();
+        assert_eq!(json["http_addr"], "0.0.0.0:8080");
+        assert_eq!(json["grpc_addr"], "0.0.0.0:9394");
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // 注意：这里返回的是未规范化配置，仅用于 serde/default 初始化与测试构造。
+        // 最低阈值、缺省填充等规范化逻辑应由配置加载/校验路径负责。
+        Self {
+            http_addr: default_http_addr(),
+            grpc_addr: default_grpc_addr(),
+            notify_interval: 0,
+            offline_threshold: 0,
+            grpc_tls: 0,
+            tls_dir: default_tls_dir(),
+            admin_user: None,
+            admin_pass: None,
+            jwt_secret: None,
+            tgbot: notifier::tgbot::Config::default(),
+            wechat: notifier::wechat::Config::default(),
+            email: notifier::email::Config::default(),
+            log: notifier::log::Config::default(),
+            webhook: notifier::webhook::Config::default(),
+            hosts: Vec::new(),
+            hosts_group: Vec::new(),
+            group_gc: 0,
+            server_url: String::new(),
+            workspace: default_workspace(),
+            hosts_map: HashMap::new(),
+            hosts_group_map: HashMap::new(),
+        }
+    }
+}

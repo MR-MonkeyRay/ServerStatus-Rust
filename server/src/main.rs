@@ -7,10 +7,8 @@ extern crate pretty_env_logger;
 extern crate prettytable;
 
 use clap::Parser;
-use once_cell::sync::OnceCell;
 use std::process;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -36,8 +34,8 @@ mod notifier;
 mod payload;
 mod stats;
 
-static G_CONFIG: OnceCell<crate::config::Config> = OnceCell::new();
-static G_STATS_MGR: OnceCell<crate::stats::StatsMgr> = OnceCell::new();
+static G_CONFIG: OnceLock<crate::config::Config> = OnceLock::new();
+static G_STATS_MGR: OnceLock<crate::stats::StatsMgr> = OnceLock::new();
 
 #[derive(Parser, Debug)]
 #[command(author, version = env!("APP_VERSION"), about, long_about = None)]
@@ -111,7 +109,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // config test
     if args.config_test {
-        config::test_from_file(&args.config).unwrap();
+        config::test_from_file(&args.config)?;
         eprintln!("✨ the conf file {} syntax is ok", &args.config);
         eprintln!("✨ the conf file {} test is successful", &args.config);
         process::exit(0);
@@ -127,47 +125,63 @@ async fn main() -> Result<(), anyhow::Error> {
         eprintln!("✨ run in normal mode, load conf from local file `{}", &args.config);
         config::from_file(&args.config)
     } {
-        debug!("{}", serde_json::to_string_pretty(&cfg).unwrap());
-        G_CONFIG.set(cfg).unwrap();
+        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+            debug!("{}", json);
+        }
+        G_CONFIG.set(cfg).map_err(|_| anyhow::anyhow!("Failed to initialize global config"))?;
     } else {
         error!("can't parse config");
         process::exit(1);
     }
 
     // init tpl
-    http::init_jinja_tpl().unwrap();
+    http::init_jinja_tpl()?;
 
     // init notifier
-    *notifier::NOTIFIER_HANDLE.lock().unwrap() = Some(Handle::current());
-    let cfg = G_CONFIG.get().unwrap();
+    *notifier::NOTIFIER_HANDLE.lock()
+        .map_err(|e| anyhow::anyhow!("Failed to lock NOTIFIER_HANDLE: {}", e))? = Some(Handle::current());
+    let cfg = G_CONFIG.get()
+        .ok_or_else(|| anyhow::anyhow!("G_CONFIG not initialized"))?;
     let notifies: Arc<Mutex<Vec<Box<dyn notifier::Notifier + Send>>>> = Arc::new(Mutex::new(Vec::new()));
     if cfg.tgbot.enabled {
         let o = Box::new(notifier::tgbot::TGBot::new(&cfg.tgbot));
-        notifies.lock().unwrap().push(o);
+        notifies.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock notifies: {}", e))?
+            .push(o);
     }
     if cfg.wechat.enabled {
         let o = Box::new(notifier::wechat::WeChat::new(&cfg.wechat));
-        notifies.lock().unwrap().push(o);
+        notifies.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock notifies: {}", e))?
+            .push(o);
     }
     if cfg.email.enabled {
         let o = Box::new(notifier::email::Email::new(&cfg.email));
-        notifies.lock().unwrap().push(o);
+        notifies.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock notifies: {}", e))?
+            .push(o);
     }
     if cfg.log.enabled {
         let o = Box::new(notifier::log::Log::new(&cfg.log));
-        notifies.lock().unwrap().push(o);
+        notifies.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock notifies: {}", e))?
+            .push(o);
     }
     if cfg.webhook.enabled {
         let o = Box::new(notifier::webhook::Webhook::new(&cfg.webhook));
-        notifies.lock().unwrap().push(o);
+        notifies.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock notifies: {}", e))?
+            .push(o);
     }
     // init notifier end
 
     // notify test
     if args.notify_test {
-        for notifier in &*notifies.lock().unwrap() {
+        let notifies_guard = notifies.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock notifies: {}", e))?;
+        for notifier in &*notifies_guard {
             eprintln!("send test message to {}", notifier.kind());
-            notifier.notify_test().unwrap();
+            notifier.notify_test()?;
         }
         thread::sleep(Duration::from_millis(7000)); // TODO: wait
         eprintln!("Please check for notifications");
@@ -176,11 +190,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // init mgr
     let mut mgr = crate::stats::StatsMgr::new();
-    mgr.init(G_CONFIG.get().unwrap(), notifies)?;
-    if G_STATS_MGR.set(mgr).is_err() {
-        error!("can't set G_STATS_MGR");
-        process::exit(1);
-    }
+    let cfg_ref = G_CONFIG.get()
+        .ok_or_else(|| anyhow::anyhow!("G_CONFIG not initialized"))?;
+    mgr.init(cfg_ref, notifies)?;
+    G_STATS_MGR.set(mgr)
+        .map_err(|_| anyhow::anyhow!("Failed to initialize G_STATS_MGR"))?;
 
     // serv grpc
     tokio::spawn(async move { grpc::serv_grpc(cfg).await });
@@ -188,11 +202,12 @@ async fn main() -> Result<(), anyhow::Error> {
     let http_addr = cfg.http_addr.clone();
     eprintln!("🚀 listening on http://{http_addr}");
 
-    let listener = TcpListener::bind(&http_addr).await.unwrap();
+    let listener = TcpListener::bind(&http_addr).await
+        .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", http_addr, e))?;
     axum::serve(listener, create_app_router())
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .map_err(|e| anyhow::anyhow!("Server error: {}", e))?;
 
     Ok(())
 }

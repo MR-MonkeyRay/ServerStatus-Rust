@@ -1,9 +1,8 @@
 use anyhow::Result;
 use minijinja::{value::Value, Environment};
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-pub static JINJA_ENV: Lazy<Mutex<Environment>> = Lazy::new(|| Mutex::new(Environment::new()));
+pub static JINJA_ENV: LazyLock<Mutex<Environment>> = LazyLock::new(|| Mutex::new(Environment::new()));
 
 pub fn add_template(kind: &str, tag: &str, tpl: String) {
     let name = format!("{kind}.{tag}");

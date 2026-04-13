@@ -6,7 +6,8 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::sync::Arc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use sysinfo::CpuRefreshKind;
@@ -43,7 +44,8 @@ pub static G_EXPECT_FS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "fuse.rclone",
     ]
 });
-pub static G_CPU_PERCENT: LazyLock<Arc<Mutex<f64>>> = LazyLock::new(|| Arc::new(Mutex::default()));
+// Store CPU percentage as u64 (value * 100) for atomic operations
+pub static G_CPU_PERCENT: AtomicU64 = AtomicU64::new(0);
 
 /// A minimal disk descriptor used by [`calc_hdd_stats`] so the logic can be
 /// tested without OS-level disk enumeration.
@@ -94,9 +96,9 @@ pub fn start_cpu_percent_collect_t() {
         sys.refresh_cpu_all();
 
         let global_cpu = sys.global_cpu_usage();
-        if let Ok(mut cpu_percent) = G_CPU_PERCENT.lock() {
-            *cpu_percent = f64::from(global_cpu.round());
-        }
+        // Store as integer (percentage * 100) for atomic operations
+        let cpu_int = (f64::from(global_cpu.round()) * 100.0) as u64;
+        G_CPU_PERCENT.store(cpu_int, Ordering::Relaxed);
 
         thread::sleep(Duration::from_millis(SAMPLE_PERIOD));
     });
@@ -108,7 +110,7 @@ pub struct NetSpeed {
     pub net_tx: u64,
 }
 
-pub static G_NET_SPEED: LazyLock<Arc<Mutex<NetSpeed>>> = LazyLock::new(|| Arc::new(Mutex::default()));
+pub static G_NET_SPEED: LazyLock<Arc<RwLock<NetSpeed>>> = LazyLock::new(|| Arc::new(RwLock::default()));
 
 pub fn start_net_speed_collect_t(args: &Args) {
     let mut networks = Networks::new_with_refreshed_list();
@@ -123,7 +125,7 @@ pub fn start_net_speed_collect_t(args: &Args) {
             net_rx += data.received();
             net_tx += data.transmitted();
         }
-        if let Ok(mut t) = G_NET_SPEED.lock() {
+        if let Ok(mut t) = G_NET_SPEED.write() {
             t.net_rx = net_rx;
             t.net_tx = net_tx;
         }
@@ -240,10 +242,9 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
         stat.network_out = network_out;
     }
 
-    if let Ok(o) = G_CPU_PERCENT.lock() {
-        stat.cpu = *o;
-    }
-    if let Ok(o) = G_NET_SPEED.lock() {
+    // Load CPU percentage from atomic (stored as value * 100)
+    stat.cpu = G_CPU_PERCENT.load(Ordering::Relaxed) as f64 / 100.0;
+    if let Ok(o) = G_NET_SPEED.read() {
         stat.network_rx = o.net_rx;
         stat.network_tx = o.net_tx;
     }

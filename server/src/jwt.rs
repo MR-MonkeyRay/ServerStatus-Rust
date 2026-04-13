@@ -9,15 +9,15 @@ use axum_extra::{
     TypedHeader,
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt::Display;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::G_CONFIG;
 
-pub static KEYS: Lazy<Keys> = Lazy::new(|| {
+pub static KEYS: LazyLock<Keys> = LazyLock::new(|| {
     let cfg = G_CONFIG.get().unwrap();
     Keys::new(cfg.jwt_secret.as_ref().unwrap().as_bytes())
 });
